@@ -4,6 +4,7 @@ import { createShape, updateShape, deleteShape, listShapes } from './shapeHandle
 import { transformShape } from './transformHandlers.js'
 import { createGroup } from './groupHandlers.js'
 import { addImage, getImageInfo } from './imageHandlers.js'
+import { loadFont } from './fontHandlers.js'
 import { ActionNotFoundError } from '../utils/errorTypes.js'
 
 const ACTION_MAP = {
@@ -20,6 +21,7 @@ const ACTION_MAP = {
   create_group:     createGroup,
   add_image:        addImage,
   get_image_info:   getImageInfo,
+  load_font:        loadFont,
 }
 
 export async function dispatch(action, params) {

@@ -69,6 +69,27 @@ async def _call(action: str, **kwargs) -> dict:
 
 
 @mcp.tool()
+async def load_font(
+    file_path: str,
+    family: str,
+    style: Optional[str] = None,
+    weight: Optional[str] = None,
+) -> dict:
+    """Register a custom font file (.ttf, .otf, .woff) so it can be used in text shapes.
+
+    Must be called BEFORE creating any text shapes that use this font family.
+    Fonts are registered globally and persist for the lifetime of the bridge process.
+
+    Args:
+        file_path: Absolute path to the font file on disk (.ttf, .otf, or .woff).
+        family: The font family name to register (e.g. "TT Supermolot Neue").
+        style: Optional CSS font-style value (e.g. "normal", "italic"). Defaults to "normal".
+        weight: Optional CSS font-weight value (e.g. "normal", "bold"). Defaults to "normal".
+    """
+    return await _call("load_font", file_path=file_path, family=family, style=style, weight=weight)
+
+
+@mcp.tool()
 async def create_canvas(width: int, height: int, background: Optional[str] = None) -> dict:
     """Create a new Konva canvas (Stage + default Layer). Returns canvas_id and layer_id.
 
