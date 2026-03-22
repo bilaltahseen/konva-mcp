@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import os
 import tempfile
-from typing import Optional, Literal
+from io import BytesIO
+from typing import Optional
+
+from PIL import Image as PILImage
 
 from fastmcp import FastMCP
 from fastmcp.utilities.types import Image
@@ -14,16 +17,16 @@ mcp = FastMCP(
     "konva-canvas",
     instructions=(
         "A 2D canvas tool powered by Konva.js. "
-        "Build canvases in phases: create canvas and layers, then add shapes section by section. "
-        "After each major section, call preview_canvas to visually inspect progress — "
-        "use update_shape or delete_shape to correct anything that looks wrong before continuing. "
-        "Call export_canvas only when the design is complete. "
-        "All IDs returned by tools must be passed back to subsequent calls."
+        "Workflow: (1) create_canvas, (2) batch_design to add layers/shapes in bulk, "
+        "(3) preview_canvas to inspect — fix issues with another batch_design call, "
+        "(4) export_canvas when done. "
+        "All IDs returned by tools must be passed into subsequent calls."
     ),
 )
 
 _bridge: BridgeClient | None = None
 
+_PREVIEW_MAX_DIM = 800  # longest edge in pixels; keeps token cost low for VLMs
 
 def _get_bridge() -> BridgeClient:
     if _bridge is None:
@@ -40,24 +43,26 @@ def _to_camel(s: str) -> str:
     return parts[0] + "".join(p.title() for p in parts[1:])
 
 
+_SKIP_CAMEL = {
+    "canvas_id", "layer_id", "shape_id", "group_id", "shape_type",
+    "shape_ids", "operation", "axis", "format", "pixel_ratio", "name", "file_path",
+}
+# Keys whose camelCase conversion doesn't follow the standard pattern
+_PARAM_ALIASES: dict[str, str] = {
+    "clock_wise": "clockwise",
+}
+
+
 def _camel_params(d: dict) -> dict:
-    # Keys in this set are expected by the JS bridge in snake_case and
-    # must not be converted to camelCase.
-    skip = {
-        "canvas_id",
-        "layer_id",
-        "shape_id",
-        "group_id",
-        "shape_type",
-        "shape_ids",
-        "operation",
-        "axis",
-        "format",
-        "pixel_ratio",
-        "name",
-        "file_path",
-    }
-    return {(_to_camel(k) if k not in skip else k): v for k, v in d.items()}
+    result = {}
+    for k, v in d.items():
+        if k in _PARAM_ALIASES:
+            result[_PARAM_ALIASES[k]] = v
+        elif k in _SKIP_CAMEL:
+            result[k] = v
+        else:
+            result[_to_camel(k)] = v
+    return result
 
 
 async def _call(action: str, **kwargs) -> dict:
@@ -102,235 +107,217 @@ async def create_canvas(width: int, height: int, background: Optional[str] = Non
 
 
 @mcp.tool()
-async def add_image(
-    canvas_id: str,
-    layer_id: str,
-    file_path: str,
-    x: float = 0,
-    y: float = 0,
-    width: Optional[float] = None,
-    height: Optional[float] = None,
-    opacity: Optional[float] = None,
-) -> dict:
-    """Place a PNG, JPEG, or SVG file onto the canvas as an image shape. Returns shape_id.
-
-    Supported formats: .png, .jpg, .jpeg, .gif, .webp, .bmp, .svg
-    SVG files are rasterised to the target dimensions before placement.
-
-    Args:
-        canvas_id: ID returned by create_canvas.
-        layer_id: ID of the layer to add the image to.
-        file_path: Absolute path to the image file on disk.
-        x: Left edge position in pixels (default 0).
-        y: Top edge position in pixels (default 0).
-        width: Render width in pixels. Defaults to the image's natural width.
-        height: Render height in pixels. Defaults to the image's natural height.
-        opacity: Opacity from 0.0 (transparent) to 1.0 (opaque).
-    """
-    return await _call(
-        "add_image",
-        canvas_id=canvas_id, layer_id=layer_id, file_path=file_path,
-        x=x, y=y, width=width, height=height, opacity=opacity,
-    )
-
-
-@mcp.tool()
 async def image_info(file_path: str) -> dict:
     """Return metadata about an image file without placing it on a canvas.
 
     Returns {file_path, width, height, format, size_bytes, aspect_ratio}.
-    Supported formats: .png, .jpg, .jpeg, .gif, .webp, .bmp, .svg
+    Supported formats: .png, .jpg, .jpeg, .gif, .webp, .bmp
 
     Args:
         file_path: Absolute path to the image file on disk.
     """
-    return await _call("get_image_info", file_path=file_path)
+    try:
+        with PILImage.open(file_path) as img:
+            w, h = img.size
+            fmt = img.format or os.path.splitext(file_path)[1].lstrip(".").upper()
+        size_bytes = os.path.getsize(file_path)
+        return {
+            "file_path": file_path,
+            "width": w,
+            "height": h,
+            "format": fmt.lower(),
+            "size_bytes": size_bytes,
+            "aspect_ratio": round(w / h, 4) if h else None,
+        }
+    except FileNotFoundError:
+        return {"error": "NOT_FOUND", "message": f"File not found: {file_path}"}
+    except Exception as e:
+        return {"error": "READ_ERROR", "message": str(e)}
 
 
 @mcp.tool()
-async def add_layer(canvas_id: str, name: Optional[str] = None) -> dict:
-    """Add a new Layer to a canvas. Layers render bottom-to-top. Returns layer_id.
+async def batch_design(canvas_id: str, ops: list[dict]) -> list[dict]:
+    """Execute multiple layer and shape operations in a single call.
 
-    Args:
-        canvas_id: ID returned by create_canvas.
-        name: Optional label for the layer.
+    Operations run in order; results are returned in the same order.
+    canvas_id is injected automatically — do not include it in individual ops.
+
+    Each op must have an "action" key. Supported actions and their params:
+
+      add_layer:       {name?}
+      add_image:       {layer_id, file_path, x?, y?, width?, height?, opacity?}
+      create_shape:    {layer_id, shape_type, x?, y?, width?, height?, radius?,
+                        fill?, stroke?, stroke_width?, opacity?, rotation?,
+                        text?, font_size?, font_family?, font_style?, align?,
+                        points?, tension?, closed?, data?, num_points?,
+                        inner_radius?, outer_radius?, sides?, angle?, clock_wise?}
+      update_shape:    {shape_id, x?, y?, width?, height?, radius?,
+                        fill?, stroke?, stroke_width?, opacity?, rotation?,
+                        text?, font_size?, visible?}
+      delete_shape:    {shape_id}
+      transform_shape: {shape_id, operation, x?, y?, degrees?,
+                        scale_x?, scale_y?, axis?}
+                        operations: move | rotate | scale | flip
+      clear_layer:     {layer_id}
+      create_group:    {layer_id, shape_ids, x?, y?}
+
+    shape_type values for create_shape:
+      rect, circle, ellipse, line, arrow, text, path,
+      star, regular_polygon, wedge, ring, arc
     """
-    return await _call("add_layer", canvas_id=canvas_id, name=name)
+    results = []
+    for op in ops:
+        op = {k: v for k, v in op.items() if v is not None}
+        action = op.pop("action")
+        op["canvas_id"] = canvas_id
+        params = _camel_params(op)
+        try:
+            result = await _get_bridge().execute(action, params)
+        except BridgeError as e:
+            result = {"error": e.code, "message": str(e)}
+        results.append({"action": action, **result})
+    return results
+
+
+def _get_bbox(attrs: dict) -> tuple[float, float, float, float] | None:
+    """Return (x1, y1, x2, y2) axis-aligned bounding box from shape attrs, or None."""
+    x, y = attrs.get("x", 0), attrs.get("y", 0)
+    w, h = attrs.get("width"), attrs.get("height")
+    r = attrs.get("radius")
+    rx, ry = attrs.get("radiusX"), attrs.get("radiusY")
+    outer_r = attrs.get("outerRadius")
+    pts = attrs.get("points")
+
+    if w is not None and h is not None:
+        return (x, y, x + w, y + h)
+    if r is not None:
+        return (x - r, y - r, x + r, y + r)
+    if rx is not None and ry is not None:
+        return (x - rx, y - ry, x + rx, y + ry)
+    if outer_r is not None:
+        return (x - outer_r, y - outer_r, x + outer_r, y + outer_r)
+    if pts and len(pts) >= 2:
+        xs, ys = pts[0::2], pts[1::2]
+        return (min(xs), min(ys), max(xs), max(ys))
+    return None
+
+
+def _boxes_overlap(a: tuple, b: tuple) -> bool:
+    return not (a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1])
 
 
 @mcp.tool()
-async def create_shape(
-    canvas_id: str,
-    layer_id: str,
-    shape_type: Literal["rect", "circle", "ellipse", "line", "arrow", "text",
-                        "path", "star", "regular_polygon", "wedge", "ring", "arc"],
-    x: float = 0,
-    y: float = 0,
-    width: Optional[float] = None,
-    height: Optional[float] = None,
-    radius: Optional[float] = None,
-    fill: Optional[str] = None,
-    stroke: Optional[str] = None,
-    stroke_width: Optional[float] = None,
-    opacity: Optional[float] = None,
-    rotation: Optional[float] = None,
-    text: Optional[str] = None,
-    font_size: Optional[int] = None,
-    font_family: Optional[str] = None,
-    font_style: Optional[str] = None,
-    align: Optional[str] = None,
-    points: Optional[list[float]] = None,
-    tension: Optional[float] = None,
-    closed: Optional[bool] = None,
-    data: Optional[str] = None,
-    num_points: Optional[int] = None,
-    inner_radius: Optional[float] = None,
-    outer_radius: Optional[float] = None,
-    sides: Optional[int] = None,
-    angle: Optional[float] = None,
-    clock_wise: Optional[bool] = None,
-) -> dict:
-    """Create a shape on the canvas. Returns shape_id and attrs.
+async def batch_get(canvas_id: str, queries: list[dict]) -> list[dict]:
+    """Run multiple read queries against a canvas in a single call.
 
-    Required properties by shape_type:
-    - rect: width, height
-    - circle: radius
-    - ellipse: width (radiusX), height (radiusY)
-    - line/arrow: points=[x1,y1,x2,y2,...]
-    - text: text, font_size
-    - path: data (SVG path string d attribute)
-    - star: num_points, inner_radius, outer_radius
-    - regular_polygon: sides, radius
-    - wedge: radius, angle
-    - ring: inner_radius, outer_radius
-    - arc: inner_radius, outer_radius, angle
+    Each query must have a "type" key. Supported types:
+
+      canvas_state  — full canvas JSON hierarchy and shape index
+      list_shapes   — all shapes with attrs; optional: {layer_id}
+      find_shapes   — filtered shapes; optional: {layer_id, shape_type, text, fill}
+                      text and fill are substring matches (case-insensitive)
     """
-    params: dict = {
-        "canvas_id": canvas_id, "layer_id": layer_id, "shape_type": shape_type,
-        "x": x, "y": y,
+    results = []
+    for query in queries:
+        query = dict(query)
+        qtype = query.pop("type")
+
+        if qtype == "canvas_state":
+            result = await _call("get_canvas_state", canvas_id=canvas_id)
+
+        elif qtype == "list_shapes":
+            result = await _call("list_shapes", canvas_id=canvas_id, layer_id=query.get("layer_id"))
+
+        elif qtype == "find_shapes":
+            base = await _call("list_shapes", canvas_id=canvas_id, layer_id=query.get("layer_id"))
+            if "error" in base:
+                result = base
+            else:
+                shapes = base.get("shapes", [])
+                if st := query.get("shape_type"):
+                    shapes = [s for s in shapes if s.get("type") == st]
+                if txt := query.get("text"):
+                    shapes = [s for s in shapes if txt.lower() in str(s.get("attrs", {}).get("text", "")).lower()]
+                if fill := query.get("fill"):
+                    shapes = [s for s in shapes if fill.lower() in str(s.get("attrs", {}).get("fill", "")).lower()]
+                result = {"shapes": shapes, "count": len(shapes)}
+
+        else:
+            result = {"error": "UNKNOWN_QUERY", "message": f"Unknown query type: '{qtype}'"}
+
+        results.append({"type": qtype, **result})
+    return results
+
+
+@mcp.tool()
+async def snapshot_layout(canvas_id: str) -> dict:
+    """Analyze the canvas layout structure and detect design issues.
+
+    Returns:
+      - canvas dimensions
+      - per-layer shape counts
+      - shapes with bounding boxes outside the canvas
+      - pairs of overlapping shapes (by bounding box intersection)
+    """
+    shapes_res = await _call("list_shapes", canvas_id=canvas_id)
+    state_res = await _call("get_canvas_state", canvas_id=canvas_id)
+
+    if "error" in shapes_res:
+        return shapes_res
+    if "error" in state_res:
+        return state_res
+
+    shapes = shapes_res.get("shapes", [])
+    stage_attrs = state_res.get("state", {}).get("attrs", {})
+    canvas_w = stage_attrs.get("width", 0)
+    canvas_h = stage_attrs.get("height", 0)
+
+    # Layer summary
+    layer_counts: dict[str, int] = {}
+    for s in shapes:
+        lid = s["layer_id"]
+        layer_counts[lid] = layer_counts.get(lid, 0) + 1
+
+    # Bounding boxes
+    bboxes: dict[str, tuple] = {}
+    for s in shapes:
+        bb = _get_bbox(s.get("attrs", {}))
+        if bb:
+            bboxes[s["shape_id"]] = bb
+
+    # Out-of-bounds detection
+    out_of_bounds = []
+    for s in shapes:
+        bb = bboxes.get(s["shape_id"])
+        if not bb:
+            continue
+        reasons = []
+        if bb[0] < 0:          reasons.append("left edge out of bounds")
+        if bb[1] < 0:          reasons.append("top edge out of bounds")
+        if canvas_w and bb[2] > canvas_w: reasons.append("right edge out of bounds")
+        if canvas_h and bb[3] > canvas_h: reasons.append("bottom edge out of bounds")
+        if reasons:
+            out_of_bounds.append({"shape_id": s["shape_id"], "type": s["type"], "issues": reasons})
+
+    # Overlap detection (O(n²) on bboxed shapes)
+    overlaps = []
+    boxed = [s for s in shapes if s["shape_id"] in bboxes]
+    for i in range(len(boxed)):
+        for j in range(i + 1, len(boxed)):
+            a, b = boxed[i], boxed[j]
+            if _boxes_overlap(bboxes[a["shape_id"]], bboxes[b["shape_id"]]):
+                overlaps.append({
+                    "shape_a": a["shape_id"], "type_a": a["type"],
+                    "shape_b": b["shape_id"], "type_b": b["type"],
+                })
+
+    return {
+        "canvas": {"width": canvas_w, "height": canvas_h},
+        "layers": [{"layer_id": lid, "shape_count": cnt} for lid, cnt in layer_counts.items()],
+        "total_shapes": len(shapes),
+        "out_of_bounds": out_of_bounds,
+        "overlaps": overlaps,
     }
-    optional_map = {
-        "width": width, "height": height, "radius": radius,
-        "fill": fill, "stroke": stroke, "strokeWidth": stroke_width,
-        "opacity": opacity, "rotation": rotation,
-        "text": text, "fontSize": font_size, "fontFamily": font_family,
-        "fontStyle": font_style, "align": align,
-        "points": points, "tension": tension, "closed": closed,
-        "data": data,
-        "numPoints": num_points, "innerRadius": inner_radius, "outerRadius": outer_radius,
-        "sides": sides, "angle": angle, "clockwise": clock_wise,
-    }
-    params.update({k: v for k, v in optional_map.items() if v is not None})
-    try:
-        return await _get_bridge().execute("create_shape", params)
-    except BridgeError as e:
-        return {"error": e.code, "message": str(e)}
-
-
-@mcp.tool()
-async def update_shape(
-    canvas_id: str,
-    shape_id: str,
-    x: Optional[float] = None,
-    y: Optional[float] = None,
-    width: Optional[float] = None,
-    height: Optional[float] = None,
-    radius: Optional[float] = None,
-    fill: Optional[str] = None,
-    stroke: Optional[str] = None,
-    stroke_width: Optional[float] = None,
-    opacity: Optional[float] = None,
-    rotation: Optional[float] = None,
-    text: Optional[str] = None,
-    font_size: Optional[int] = None,
-    visible: Optional[bool] = None,
-) -> dict:
-    """Update properties of an existing shape. Only provided (non-None) values are changed."""
-    return await _call(
-        "update_shape",
-        canvas_id=canvas_id, shape_id=shape_id,
-        x=x, y=y, width=width, height=height, radius=radius,
-        fill=fill, stroke=stroke, stroke_width=stroke_width,
-        opacity=opacity, rotation=rotation,
-        text=text, font_size=font_size, visible=visible,
-    )
-
-
-@mcp.tool()
-async def delete_shape(canvas_id: str, shape_id: str) -> dict:
-    """Remove a shape from the canvas permanently."""
-    return await _call("delete_shape", canvas_id=canvas_id, shape_id=shape_id)
-
-
-@mcp.tool()
-async def transform_shape(
-    canvas_id: str,
-    shape_id: str,
-    operation: Literal["move", "rotate", "scale", "flip"],
-    x: Optional[float] = None,
-    y: Optional[float] = None,
-    degrees: Optional[float] = None,
-    scale_x: Optional[float] = None,
-    scale_y: Optional[float] = None,
-    axis: Optional[Literal["horizontal", "vertical"]] = None,
-) -> dict:
-    """Apply a 2D transformation to a shape.
-
-    Operations:
-    - move: set absolute position (x, y)
-    - rotate: set absolute rotation in degrees
-    - scale: set scale factors (scale_x, scale_y; 1.0 = original size)
-    - flip: mirror along axis ("horizontal" or "vertical")
-    """
-    params: dict = {"canvas_id": canvas_id, "shape_id": shape_id, "operation": operation}
-    if x is not None:       params["x"] = x
-    if y is not None:       params["y"] = y
-    if degrees is not None: params["degrees"] = degrees
-    if scale_x is not None: params["scaleX"] = scale_x
-    if scale_y is not None: params["scaleY"] = scale_y
-    if axis is not None:    params["axis"] = axis
-    try:
-        return await _get_bridge().execute("transform_shape", params)
-    except BridgeError as e:
-        return {"error": e.code, "message": str(e)}
-
-
-@mcp.tool()
-async def list_shapes(canvas_id: str, layer_id: Optional[str] = None) -> dict:
-    """List all shapes on the canvas with IDs, types, and attributes. Filter by layer_id."""
-    return await _call("list_shapes", canvas_id=canvas_id, layer_id=layer_id)
-
-
-@mcp.tool()
-async def clear_layer(canvas_id: str, layer_id: str) -> dict:
-    """Remove all shapes from a layer. The layer itself remains."""
-    return await _call("clear_layer", canvas_id=canvas_id, layer_id=layer_id)
-
-
-@mcp.tool()
-async def create_group(
-    canvas_id: str,
-    layer_id: str,
-    shape_ids: list[str],
-    x: float = 0,
-    y: float = 0,
-) -> dict:
-    """Group multiple shapes into a single addressable unit.
-
-    Transformations on the group affect all children. Returns group_id.
-    """
-    params = {"canvas_id": canvas_id, "layer_id": layer_id,
-              "shape_ids": shape_ids, "x": x, "y": y}
-    try:
-        return await _get_bridge().execute("create_group", params)
-    except BridgeError as e:
-        return {"error": e.code, "message": str(e)}
-
-
-@mcp.tool()
-async def get_canvas_state(canvas_id: str) -> dict:
-    """Return the full JSON state of the canvas including all layers and shapes."""
-    return await _call("get_canvas_state", canvas_id=canvas_id)
 
 
 @mcp.tool()
@@ -350,24 +337,19 @@ async def preview_canvas(canvas_id: str, pixel_ratio: float = 1.0) -> Image:
         result = await bridge.execute("export_canvas", params)
     except BridgeError as e:
         return {"error": e.code, "message": str(e)}
+
     raw = base64.b64decode(result["data"])
-    return Image(data=raw, format="png")
+    img = PILImage.open(BytesIO(raw))
 
+    w, h = img.size
+    if max(w, h) > _PREVIEW_MAX_DIM:
+        scale = _PREVIEW_MAX_DIM / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
 
-@mcp.tool()
-async def export_canvas_json(canvas_id: str) -> dict:
-    """Export the canvas state as a JSON file saved to a temp file.
+    buf = BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=75, optimize=True)
+    return Image(data=buf.getvalue(), format="jpeg")
 
-    Returns {canvas_id, format, file_path} pointing to the saved JSON.
-    """
-    import json
-    result = await _call("get_canvas_state", canvas_id=canvas_id)
-    if "error" in result:
-        return result
-    path = os.path.join(tempfile.gettempdir(), f"konva_{canvas_id}.json")
-    with open(path, "w") as f:
-        json.dump(result, f, indent=2)
-    return {"canvas_id": canvas_id, "format": "json", "file_path": path}
 
 
 @mcp.tool()

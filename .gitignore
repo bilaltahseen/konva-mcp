@@ -9,3 +9,5 @@ settings.local.json
 .mcp.json
 package-lock.json
 assets/
+agent/
+konva-mcp-chat-ui/

@@ -91,21 +91,23 @@ These are non-text visual elements (backgrounds, products, logos, decorative ele
 | `{layerName}.svg` | Vector version (available but PNG is preferred for konva) |
 | `{layerName}_paint.png` | Paint/mask version (do not use unless specifically requested) |
 
-**Render using `add_image`:**
+**Render using `batch_design` with the `add_image` action:**
 
 ```
-add_image(
-  canvas_id = canvas_id,
-  layer_id  = layer_id,
-  file_path = "<absolute_path_to_assets>/{layerName}.png",
-  x         = layer.x,
-  y         = layer.y,
-  width     = layer.width,
-  height    = layer.height
-)
+batch_design(canvas_id, [
+  {
+    "action":    "add_image",
+    "layer_id":  layer_id,
+    "file_path": "<absolute_path_to_assets>/{layerName}.png",
+    "x":         layer.x,
+    "y":         layer.y,
+    "width":     layer.width,
+    "height":    layer.height
+  }
+])
 ```
 
-Use the layer's `x`, `y`, `width`, `height` values exactly as specified in meta.json. These define the positioned bounding box on the artboard.
+When rendering multiple image layers together, include all of them as separate ops in a single `batch_design` call. Use the layer's `x`, `y`, `width`, `height` values exactly as specified in meta.json.
 
 ### 3b. Text Layers (type: "TextFrame")
 
@@ -124,20 +126,22 @@ Use the layer's `x`, `y`, `width`, `height` values exactly as specified in meta.
 4. **Position and size** from the text_profile entry's `x`, `y`, `width`, `height`.
 
 ```
-create_shape(
-  canvas_id   = canvas_id,
-  layer_id    = layer_id,
-  shape_type  = "text",
-  text        = joined_paragraphs,
-  x           = text_profile.x,
-  y           = text_profile.y,
-  width       = text_profile.width,
-  font_size   = round(rune.attrs.size),
-  font_family = rune.attrs.fontFamily,
-  font_style  = mapped_font_style,
-  fill        = rune.attrs.fill.hex,
-  align       = mapped_justification
-)
+batch_design(canvas_id, [
+  {
+    "action":      "create_shape",
+    "layer_id":    layer_id,
+    "shape_type":  "text",
+    "text":        joined_paragraphs,
+    "x":           text_profile.x,
+    "y":           text_profile.y,
+    "width":       text_profile.width,
+    "font_size":   round(rune.attrs.size),
+    "font_family": rune.attrs.fontFamily,
+    "font_style":  mapped_font_style,
+    "fill":        rune.attrs.fill.hex,
+    "align":       mapped_justification
+  }
+])
 ```
 
 **Image-based fallback:** Only use the pre-rendered `{layerName}.png` via `add_image` for TextFrame layers if the user explicitly requests image-based text rendering. The default is always native text via text_profile.
@@ -149,14 +153,47 @@ create_shape(
 After placing each layer (or group of related layers), call `preview_canvas` to visually inspect progress.
 
 - Check that positions, sizes, and stacking order look correct.
-- If something looks wrong, use `update_shape` or `delete_shape` to fix it before continuing.
+- If something looks wrong, use `batch_design` with `update_shape` or `delete_shape` actions to fix it before continuing.
 - Do **not** wait until the end to preview.
+
+> `preview_canvas` returns a downscaled JPEG (max 800px on the longest edge) optimised for token efficiency. It is sufficient for layout verification but not pixel-perfect QA.
+
+---
+
+## Step 5b: Validate Layout Before Export
+
+Before exporting, call `snapshot_layout` to programmatically verify the design:
+
+```
+snapshot_layout(canvas_id)
+```
+
+Inspect the returned report:
+
+| Field | What to check |
+|---|---|
+| `out_of_bounds` | Must be empty — no shape should extend outside the canvas |
+| `overlaps` | Must be empty — no two shapes should intersect (5px minimum gap) |
+| `layers` | Shape counts match the number of layers you rendered |
+
+If `out_of_bounds` or `overlaps` is non-empty, fix the offending shapes with `batch_design` (`update_shape` ops to reposition/resize) and re-run `snapshot_layout` until both lists are empty.
+
+**Inspecting specific shapes during troubleshooting** — use `batch_get` to read design state:
+
+```
+batch_get(canvas_id, [
+  {"type": "list_shapes"},                          // all shapes with full attrs
+  {"type": "find_shapes", "shape_type": "text"},    // filter by type
+  {"type": "find_shapes", "text": "headline"},      // filter by text content (substring)
+  {"type": "canvas_state"}                          // full Konva JSON hierarchy
+])
+```
 
 ---
 
 ## Step 6: Export
 
-Once all layers are placed and visually verified, call `export_canvas` to produce the final PNG output.
+Once all layers are placed, visually verified, and `snapshot_layout` reports no issues, call `export_canvas` to produce the final PNG output.
 
 ---
 
@@ -172,9 +209,9 @@ Once all layers are placed and visually verified, call `export_canvas` to produc
 
 5. **Layer ordering matters.** Background (highest `layerIndex`) goes first, foreground (lowest `layerIndex`) goes last. This ensures correct visual stacking in Konva.
 
-6. **One default layer is enough.** Use the single `layer_id` returned by `create_canvas` for all shapes. You do not need to call `add_layer` unless the design explicitly requires separate Konva layers for compositing.
+6. **One default layer is enough.** Use the single `layer_id` returned by `create_canvas` for all shapes. You do not need to use the `add_layer` action in `batch_design` unless the design explicitly requires separate Konva layers for compositing.
 
-7. **Text rendering.** When using native text (Strategy B), if a text_profile has multiple paragraphs with different font sizes or colors within the same frame, render each paragraph as a separate `create_shape` call with appropriate y-offset calculated from leading/line height.
+7. **Text rendering.** When using native text (Strategy B), if a text_profile has multiple paragraphs with different font sizes or colors within the same frame, render each paragraph as a separate `create_shape` op in the same `batch_design` call, with appropriate y-offset calculated from leading/line height.
 
 8. **Blend modes.** Konva does not natively support Illustrator blend modes. If a layer has `blend_mode` other than "NORMAL", note it but render normally — do not attempt to simulate blend modes.
 
@@ -182,7 +219,7 @@ Once all layers are placed and visually verified, call `export_canvas` to produc
 
 10. **Preview frequently.** Call `preview_canvas` after placing the background, after placing product/logo images, and after placing text — at minimum 3 previews before export.
 
-11. **No overlapping elements.** Elements must never overlap each other. Maintain a minimum gap of **5px** between the bounding boxes of all adjacent elements. When repositioning or scaling layers for a custom canvas size, calculate layouts so that no two elements' bounding boxes (x, y, width, height) intersect, and ensure at least 5px of clear space separates every pair of neighboring elements.
+11. **No overlapping elements.** Elements must never overlap each other. Maintain a minimum gap of **5px** between the bounding boxes of all adjacent elements. When repositioning or scaling layers for a custom canvas size, calculate layouts so that no two elements' bounding boxes (x, y, width, height) intersect, and ensure at least 5px of clear space separates every pair of neighboring elements. Always verify with `snapshot_layout` before export — if `overlaps` is non-empty, fix and re-validate.
 
 12. **Preserve aspect ratio.** When scaling elements to fit a custom canvas size, always maintain each element's original aspect ratio. Compute the scale factor from one dimension and derive the other to keep proportions even. Never stretch or squash an element independently on width or height. For example, if an element's original size is `400×500` and you scale width to `200`, height must be `250` (not an arbitrary value). This applies to all layer types — images, logos, products, and text frames alike.
 
@@ -193,21 +230,20 @@ Once all layers are placed and visually verified, call `export_canvas` to produc
 Given a meta.json with 5 layers:
 
 ```
-1. Read meta.json
-2. Scan text_profile for font families → find .ttf files in assets
-3. load_font("assets/TTSupermolotNeue-CondBold.ttf", family="TT Supermolot Neue", weight="bold")
-4. load_font("assets/TTSupermolotNeue-BoldItalic.ttf", family="TT Supermolot Neue", weight="bold", style="italic")
-5. create_canvas(width=1152, height=648)
-6. Add layer "group" (background, layerIndex=4) → add_image
-7. preview_canvas ✓
-8. Add layer "layer_02" (product, layerIndex=3) → add_image
-9. Add layer "layer_01" (logo, layerIndex=2) → add_image
-10. preview_canvas ✓
-11. Add layer "layer" (slogan, layerIndex=1, type=Layer) → add_image
-12. Add layer "nothing_beats_the_original" (campaign_title, layerIndex=0, type=TextFrame) → create_shape text (from text_profile)
-13. preview_canvas ✓
-14. Fix any visual issues
-15. export_canvas
+1.  Read meta.json
+2.  Scan text_profile for font families → find .ttf files in assets
+3.  load_font("assets/TTSupermolotNeue-CondBold.ttf", family="TT Supermolot Neue", weight="bold")
+4.  load_font("assets/TTSupermolotNeue-BoldItalic.ttf", family="TT Supermolot Neue", weight="bold", style="italic")
+5.  create_canvas(width=1152, height=648)
+6.  batch_design: add_image op for "group" (background, layerIndex=4)
+7.  preview_canvas ✓
+8.  batch_design: add_image ops for "layer_02" (product) and "layer_01" (logo) in one call
+9.  preview_canvas ✓
+10. batch_design: add_image op for "layer" (slogan) + create_shape text op for "nothing_beats_the_original" (from text_profile)
+11. preview_canvas ✓
+12. snapshot_layout → check out_of_bounds and overlaps are empty
+13. Fix any issues with batch_design (update_shape ops), re-run snapshot_layout if needed
+14. export_canvas
 ```
 
 ---
@@ -220,3 +256,39 @@ The user will provide:
 - Optionally: whether to render text as images (Strategy A) or native text (Strategy B)
 
 If a layer has `type: "TextFrame"`, **always default to native text rendering** using `metadata.text_profile`. Only use image-based rendering for TextFrame layers if the user explicitly requests it.
+
+---
+
+## Tool Reference
+
+| Tool | Purpose |
+|---|---|
+| `load_font(file_path, family, weight?, style?)` | Register a font file before using it in text shapes |
+| `create_canvas(width, height, background?)` | Create canvas; returns `canvas_id` and `layer_id` |
+| `image_info(file_path)` | Get image dimensions and format without placing it |
+| `batch_design(canvas_id, ops)` | Execute multiple write ops in one call (add/create/update/delete/transform/group) |
+| `batch_get(canvas_id, queries)` | Execute multiple read queries in one call (`canvas_state`, `list_shapes`, `find_shapes`) |
+| `snapshot_layout(canvas_id)` | Analyze layout: layer counts, out-of-bounds shapes, overlapping pairs |
+| `preview_canvas(canvas_id, pixel_ratio?)` | Render canvas as a downscaled JPEG (≤800px) for visual inspection |
+| `export_canvas(canvas_id, pixel_ratio?)` | Save final canvas as a full-resolution PNG to disk |
+
+### `batch_design` supported actions
+
+| Action | Key params |
+|---|---|
+| `add_layer` | `name?` |
+| `add_image` | `layer_id`, `file_path`, `x?`, `y?`, `width?`, `height?`, `opacity?` |
+| `create_shape` | `layer_id`, `shape_type`, + shape-specific attrs |
+| `update_shape` | `shape_id`, + any attrs to change |
+| `delete_shape` | `shape_id` |
+| `transform_shape` | `shape_id`, `operation` (`move`\|`rotate`\|`scale`\|`flip`) |
+| `clear_layer` | `layer_id` |
+| `create_group` | `layer_id`, `shape_ids`, `x?`, `y?` |
+
+### `batch_get` supported query types
+
+| Type | Description | Optional params |
+|---|---|---|
+| `canvas_state` | Full Konva JSON + shape index | — |
+| `list_shapes` | All shapes with attrs | `layer_id` |
+| `find_shapes` | Filtered shapes | `layer_id`, `shape_type`, `text`, `fill` |

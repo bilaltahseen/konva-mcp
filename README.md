@@ -8,7 +8,7 @@ An MCP (Model Context Protocol) server that gives AI assistants the ability to d
 Claude ←stdio→ Python MCP (FastMCP) ←HTTP→ Node.js bridge (Express + Konva)
 ```
 
-- **Python MCP server** (`server/`) — exposes 12 tools over stdio using FastMCP, proxies calls to the bridge.
+- **Python MCP server** (`server/`) — exposes 9 tools over stdio using FastMCP, proxies calls to the bridge.
 - **Node.js bridge** (`bridge/`) — runs Konva.js headlessly via the `canvas` package, manages canvas state, renders PNGs.
 
 ## Prerequisites
@@ -33,10 +33,18 @@ npm install
 
 ```bash
 cd server
-uv run python main.py
+uv run python main.py                                      # stdio (default)
+uv run python main.py --transport sse                      # SSE on 127.0.0.1:8000
+uv run python main.py --transport http --host 0.0.0.0 --port 9000  # streamable HTTP
 ```
 
-The server starts the Node.js bridge as a subprocess, waits for it to be ready, then begins accepting MCP requests over stdio.
+The server starts the Node.js bridge as a subprocess, waits for it to be ready, then begins accepting MCP requests on the chosen transport.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--transport` | `stdio` | Transport: `stdio`, `sse`, or `http` |
+| `--host` | `127.0.0.1` | Bind host (sse/http only) |
+| `--port` | `8000` | Bind port (sse/http only) |
 
 ### Claude Desktop config
 
@@ -47,7 +55,7 @@ Add to `claude_desktop_config.json`:
   "mcpServers": {
     "konva-canvas": {
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/konva-mcp/server", "python", "main.py"]
+      "args": ["run", "--directory", "/path/to/konva-mcp/server", "python", "main.py", "--transport", "stdio"]
     }
   }
 }
@@ -61,7 +69,7 @@ Add to `claude_desktop_config.json`:
     "konva-canvas": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--directory", "/path/to/konva-mcp/server", "python", "main.py"]
+      "args": ["run", "--directory", "/path/to/konva-mcp/server", "python", "main.py", "--transport", "stdio"]
     }
   }
 }
@@ -81,29 +89,49 @@ The bridge listens on a random free port by default (overridable via `BRIDGE_POR
 | Tool | Description |
 |---|---|
 | `create_canvas` | Create a new canvas (Stage + default layer). Returns `canvas_id` and `layer_id`. |
-| `add_layer` | Add a layer to an existing canvas. Layers render bottom-to-top. |
-| `create_shape` | Draw a shape on a layer. See shape types below. |
-| `update_shape` | Update position, size, color, or other attributes of a shape. |
-| `delete_shape` | Permanently remove a shape. |
-| `transform_shape` | Move, rotate, scale, or flip a shape. |
-| `create_group` | Group multiple shapes into a single addressable unit. |
-| `list_shapes` | List all shapes on a canvas, optionally filtered by layer. |
-| `clear_layer` | Remove all shapes from a layer (layer itself remains). |
-| `get_canvas_state` | Return the full JSON state of the canvas. |
+| `batch_design` | Execute multiple layer/shape operations in one call (see actions below). |
+| `image_info` | Return metadata (dimensions, format) for an image file without placing it. |
+| `load_font` | Register a custom font file for use in text shapes. |
+| `batch_get` | Run multiple read queries in one call (see query types below). |
+| `snapshot_layout` | Analyze layout structure, detect out-of-bounds and overlapping elements. |
 | `preview_canvas` | Render the canvas and return it as an inline image for visual inspection. |
 | `export_canvas` | Export the finished canvas as a PNG file. |
+### `batch_get` query types
 
-### Shape types
+Pass `queries` as a list of objects, each with a `"type"` key. `canvas_id` is injected automatically.
 
-`rect`, `circle`, `ellipse`, `line`, `arrow`, `text`, `path`, `star`, `regular_polygon`, `wedge`, `ring`, `arc`
+| Type | Description | Optional params |
+|---|---|---|
+| `canvas_state` | Full Konva JSON hierarchy and shape index | — |
+| `list_shapes` | All shapes with attrs | `layer_id` |
+| `find_shapes` | Filtered shapes (substring match) | `layer_id`, `shape_type`, `text`, `fill` |
+
+### `batch_design` actions
+
+Pass `ops` as a list of objects, each with an `"action"` key. `canvas_id` is injected automatically.
+
+| Action | Required params | Optional params |
+|---|---|---|
+| `add_layer` | — | `name` |
+| `add_image` | `layer_id`, `file_path` | `x`, `y`, `width`, `height`, `opacity` |
+| `create_shape` | `layer_id`, `shape_type` | `x`, `y`, `width`, `height`, `radius`, `fill`, `stroke`, `stroke_width`, `opacity`, `rotation`, `text`, `font_size`, `font_family`, `font_style`, `align`, `points`, `tension`, `closed`, `data`, `num_points`, `inner_radius`, `outer_radius`, `sides`, `angle`, `clock_wise` |
+| `update_shape` | `shape_id` | `x`, `y`, `width`, `height`, `radius`, `fill`, `stroke`, `stroke_width`, `opacity`, `rotation`, `text`, `font_size`, `visible` |
+| `delete_shape` | `shape_id` | — |
+| `transform_shape` | `shape_id`, `operation` | `x`, `y`, `degrees`, `scale_x`, `scale_y`, `axis` |
+| `clear_layer` | `layer_id` | — |
+| `create_group` | `layer_id`, `shape_ids` | `x`, `y` |
+
+`shape_type` values: `rect`, `circle`, `ellipse`, `line`, `arrow`, `text`, `path`, `star`, `regular_polygon`, `wedge`, `ring`, `arc`
+
+`transform_shape` operations: `move`, `rotate`, `scale`, `flip`
 
 ### Recommended workflow
 
 1. `create_canvas` → get `canvas_id` and `layer_id`
-2. Add shapes with `create_shape`
-3. Call `preview_canvas` after each major section to visually inspect progress
-4. Fix anything with `update_shape` or `delete_shape`
-5. Call `export_canvas` when the design is complete
+2. `batch_design` to add layers and shapes in bulk
+3. `preview_canvas` after each major section to visually inspect progress
+4. Fix issues with another `batch_design` call (`update_shape` / `delete_shape` actions)
+5. `export_canvas` when the design is complete
 
 ## Project structure
 
@@ -117,8 +145,8 @@ konva-mcp/
 └── server/
     ├── main.py                # Entry point: finds free port, starts bridge, runs MCP
     ├── pyproject.toml
-    └── src/
-        ├── mcp_server.py      # FastMCP tool definitions (12 tools)
+        └── src/
+        ├── mcp_server.py      # FastMCP tool definitions (9 tools)
         ├── bridge_client.py   # httpx async HTTP client
         └── bridge_process.py  # asyncio subprocess manager
 ```
